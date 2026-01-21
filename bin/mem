@@ -1,6 +1,6 @@
 #!/bin/bash
 # mem - Persistent memory system for Claude sessions
-# https://github.com/based/mem
+# https://github.com/cristianj26/mem
 
 set -e
 

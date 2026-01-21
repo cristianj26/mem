@@ -24,7 +24,7 @@ Claude loses context between sessions. You end up re-explaining:
 
 ```bash
 # Clone to your plugins directory
-git clone https://github.com/based/mem ~/.claude/plugins/mem
+git clone https://github.com/cristianj26/mem ~/.claude/plugins/mem
 
 # Or if using plugin marketplace (coming soon)
 claude plugin install mem
