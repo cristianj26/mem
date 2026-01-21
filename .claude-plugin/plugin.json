@@ -1,0 +1,11 @@
+{
+  "name": "mem",
+  "description": "Persistent memory system for Claude sessions - maintains decisions, patterns, blockers, and todos across conversations",
+  "version": "0.1.0",
+  "author": {
+    "name": "based"
+  },
+  "repository": "https://github.com/based/mem",
+  "license": "MIT",
+  "keywords": ["memory", "context", "todos", "decisions", "persistence"]
+}

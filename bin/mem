@@ -1,0 +1,589 @@
+#!/bin/bash
+# mem - Persistent memory system for Claude sessions
+# https://github.com/based/mem
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Find .memory directory (walk up from cwd)
+find_memory_dir() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -d "$dir/.memory" ]]; then
+      echo "$dir/.memory"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+MEMORY_DIR=$(find_memory_dir 2>/dev/null || echo "")
+
+# Check for sensitive content
+check_sensitive() {
+  local content="$1"
+
+  # Combined pattern for API keys and tokens
+  local key_patterns='sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]+'
+
+  if echo "$content" | grep -qE "$key_patterns"; then
+    echo -e "${RED}Sensitive pattern detected (API key/token) - not storing${NC}" >&2
+    echo "Rephrase without secrets." >&2
+    return 1
+  fi
+
+  # Check for private keys
+  if echo "$content" | grep -q "BEGIN.*PRIVATE KEY"; then
+    echo -e "${RED}Sensitive pattern detected (private key) - not storing${NC}" >&2
+    echo "Rephrase without secrets." >&2
+    return 1
+  fi
+
+  # Check for password assignments
+  if echo "$content" | grep -qiE 'password\s*[:=]\s*\S+'; then
+    echo -e "${RED}Sensitive pattern detected (password) - not storing${NC}" >&2
+    echo "Rephrase without secrets." >&2
+    return 1
+  fi
+
+  # Check for email addresses (warning only - might be intentional)
+  if echo "$content" | grep -qE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'; then
+    echo -e "${YELLOW}Warning: Email address detected - consider removing PII${NC}" >&2
+  fi
+
+  return 0
+}
+
+# Generate next ID for a type
+next_id() {
+  local type="$1"
+  local prefix
+  case "$type" in
+    decision) prefix="d" ;;
+    pattern) prefix="p" ;;
+    blocker) prefix="b" ;;
+    todo) prefix="t" ;;
+    *) prefix="m" ;;
+  esac
+
+  local index_file="$MEMORY_DIR/index.json"
+  if [[ ! -f "$index_file" ]]; then
+    echo "${prefix}-001"
+    return
+  fi
+
+  local max_num=$(jq -r --arg type "${type}s" '.[$type][]?.id // empty' "$index_file" 2>/dev/null |
+    grep "^${prefix}-" |
+    sed "s/${prefix}-//" |
+    sort -n |
+    tail -1)
+
+  if [[ -z "$max_num" ]]; then
+    echo "${prefix}-001"
+  else
+    printf "${prefix}-%03d" $((10#$max_num + 1))
+  fi
+}
+
+# Update index.json
+update_index() {
+  local type="$1"
+  local id="$2"
+  local title="$3"
+  local file="$4"
+  local status="${5:-active}"
+  local epic="${6:-}"
+
+  local index_file="$MEMORY_DIR/index.json"
+
+  # Initialize if doesn't exist
+  if [[ ! -f "$index_file" ]]; then
+    echo '{"decisions":[],"patterns":[],"blockers":[],"todos":[]}' > "$index_file"
+  fi
+
+  local entry
+  if [[ "$type" == "todo" && -n "$epic" ]]; then
+    entry=$(jq -n --arg id "$id" --arg title "$title" --arg file "$file" --arg status "$status" --arg epic "$epic" \
+      '{id:$id,title:$title,file:$file,status:$status,epic:$epic}')
+  else
+    entry=$(jq -n --arg id "$id" --arg title "$title" --arg file "$file" --arg status "$status" \
+      '{id:$id,title:$title,file:$file,status:$status}')
+  fi
+
+  local type_key="${type}s"
+  jq --arg key "$type_key" --argjson entry "$entry" '.[$key] += [$entry]' "$index_file" > "$index_file.tmp"
+  mv "$index_file.tmp" "$index_file"
+}
+
+# Update status in index
+update_status() {
+  local id="$1"
+  local new_status="$2"
+  local index_file="$MEMORY_DIR/index.json"
+
+  jq --arg id "$id" --arg status "$new_status" '
+    .decisions |= map(if .id == $id then .status = $status else . end) |
+    .patterns |= map(if .id == $id then .status = $status else . end) |
+    .blockers |= map(if .id == $id then .status = $status else . end) |
+    .todos |= map(if .id == $id then .status = $status else . end)
+  ' "$index_file" > "$index_file.tmp"
+  mv "$index_file.tmp" "$index_file"
+}
+
+# Initialize .memory in current project
+cmd_init() {
+  if [[ -d ".memory" ]]; then
+    echo -e "${YELLOW}.memory already exists${NC}"
+    return 0
+  fi
+
+  mkdir -p .memory/{decisions,patterns,blockers,todos}
+  echo '{"decisions":[],"patterns":[],"blockers":[],"todos":[]}' > .memory/index.json
+
+  cat > .memory/.gitignore << 'EOF'
+*.tmp
+*.bak
+EOF
+
+  echo -e "${GREEN}Initialized .memory/${NC}"
+  echo "Add to git: git add .memory"
+}
+
+# Add a memory
+cmd_add() {
+  if [[ -z "$MEMORY_DIR" ]]; then
+    echo -e "${RED}No .memory found. Run 'mem init' first.${NC}" >&2
+    return 1
+  fi
+
+  local type=""
+  local title=""
+  local epic=""
+
+  # Parse flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--decision) type="decision"; shift ;;
+      -p|--pattern) type="pattern"; shift ;;
+      -b|--blocker) type="blocker"; shift ;;
+      -t|--todo) type="todo"; shift ;;
+      -e|--epic) epic="$2"; shift 2 ;;
+      *) title="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$title" ]]; then
+    echo "Usage: mem add [-d|-p|-b|-t] [-e epic] \"description\"" >&2
+    return 1
+  fi
+
+  # Check for sensitive content
+  if ! check_sensitive "$title"; then
+    return 1
+  fi
+
+  # Prompt for type if not specified
+  if [[ -z "$type" ]]; then
+    echo "What type of memory?"
+    echo "  [d] Decision - why we chose something"
+    echo "  [p] Pattern - how something works"
+    echo "  [b] Blocker - what's stopping progress"
+    echo "  [t] Todo - what needs to be done"
+    read -p "Type (d/p/b/t): " type_choice
+    case "$type_choice" in
+      d) type="decision" ;;
+      p) type="pattern" ;;
+      b) type="blocker" ;;
+      t) type="todo" ;;
+      *) echo "Invalid choice"; return 1 ;;
+    esac
+  fi
+
+  local id=$(next_id "$type")
+  local date=$(date +%Y-%m-%d)
+  local filename
+  local dir="$MEMORY_DIR/${type}s"
+
+  if [[ "$type" == "todo" && -n "$epic" ]]; then
+    dir="$MEMORY_DIR/todos/$epic"
+    mkdir -p "$dir"
+    local seq=$(ls "$dir"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    seq=$((seq + 1))
+    filename=$(printf "%03d-%s.md" "$seq" "$(echo "$title" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | head -c 30)")
+  else
+    filename="${id}-$(echo "$title" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | head -c 30).md"
+  fi
+
+  local filepath="$dir/$filename"
+  local rel_path="${filepath#$MEMORY_DIR/}"
+
+  # Create the file
+  case "$type" in
+    decision)
+      cat > "$filepath" << EOF
+---
+id: $id
+type: decision
+created: $date
+status: active
+tags: []
+---
+
+# $title
+
+**Context:** [Why was this decision needed?]
+
+**Decision:** [What was decided]
+
+**Rejected alternatives:**
+- [Alternative 1]: [Why rejected]
+
+**References:** [file.ts:line-range]
+EOF
+      ;;
+    pattern)
+      cat > "$filepath" << EOF
+---
+id: $id
+type: pattern
+created: $date
+status: active
+tags: []
+---
+
+# $title
+
+**Where:** [Which files/areas use this pattern]
+
+**How it works:** [Description]
+
+**Example:** [file.ts:line-range]
+
+**Gotchas:**
+- [Things to watch out for]
+EOF
+      ;;
+    blocker)
+      cat > "$filepath" << EOF
+---
+id: $id
+type: blocker
+created: $date
+status: active
+tags: []
+---
+
+# $title
+
+**Blocked:** [What can't proceed]
+
+**Cause:** [Why it's blocked]
+
+**Attempted:**
+- [What was tried]
+
+**Next steps:** [What might unblock it]
+EOF
+      ;;
+    todo)
+      local status="pending"
+      cat > "$filepath" << EOF
+---
+id: $id
+type: todo
+created: $date
+status: $status
+epic: ${epic:-standalone}
+---
+
+# $title
+
+**Files:** [files to touch]
+**Command:** [verification command]
+**Expected:** [what success looks like]
+EOF
+      ;;
+  esac
+
+  update_index "$type" "$id" "$title" "$rel_path" "${status:-active}" "$epic"
+
+  echo -e "${GREEN}Created ${type}:${NC} $id"
+  echo "  $filepath"
+  echo "  Edit to add details."
+}
+
+# List memories
+cmd_list() {
+  if [[ -z "$MEMORY_DIR" ]]; then
+    echo -e "${RED}No .memory found.${NC}" >&2
+    return 1
+  fi
+
+  local filter="$1"
+  local index_file="$MEMORY_DIR/index.json"
+
+  if [[ ! -f "$index_file" ]]; then
+    echo "No memories yet."
+    return 0
+  fi
+
+  if [[ -z "$filter" || "$filter" == "all" ]]; then
+    # Show all types
+    for type in decisions patterns blockers todos; do
+      local count=$(jq -r ".$type | length" "$index_file")
+      if [[ "$count" -gt 0 ]]; then
+        # Capitalize first letter (portable)
+        local label="$(echo "$type" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+        echo -e "\n${BLUE}## ${label}${NC}"
+        jq -r ".$type[] | \"  [\(.id)] \(.title) (\(.status))\"" "$index_file"
+      fi
+    done
+  else
+    # Show specific type
+    local type_key="${filter}"
+    [[ "$filter" != *s ]] && type_key="${filter}s"
+
+    local count=$(jq -r ".$type_key | length" "$index_file" 2>/dev/null)
+    if [[ -z "$count" || "$count" == "0" ]]; then
+      echo "No ${filter} found."
+      return 0
+    fi
+
+    jq -r ".$type_key[] | \"[\(.id)] \(.title) (\(.status))\"" "$index_file"
+  fi
+}
+
+# Show ready (actionable) todos
+cmd_ready() {
+  if [[ -z "$MEMORY_DIR" ]]; then
+    echo -e "${RED}No .memory found.${NC}" >&2
+    return 1
+  fi
+
+  local index_file="$MEMORY_DIR/index.json"
+
+  if [[ ! -f "$index_file" ]]; then
+    echo "No memories yet."
+    return 0
+  fi
+
+  echo -e "${BLUE}## Ready Todos${NC}"
+  local todos=$(jq -r '.todos[] | select(.status == "pending") | "[\(.id)] \(.title)"' "$index_file")
+
+  if [[ -z "$todos" ]]; then
+    echo "  No pending todos."
+  else
+    echo "$todos" | sed 's/^/  /'
+  fi
+
+  # Also show active blockers as they might be relevant
+  local blockers=$(jq -r '.blockers[] | select(.status == "active") | "[\(.id)] \(.title)"' "$index_file")
+  if [[ -n "$blockers" ]]; then
+    echo -e "\n${YELLOW}## Active Blockers${NC}"
+    echo "$blockers" | sed 's/^/  /'
+  fi
+}
+
+# Mark todo as done
+cmd_done() {
+  local id="$1"
+  if [[ -z "$id" ]]; then
+    echo "Usage: mem done <id>" >&2
+    return 1
+  fi
+
+  if [[ -z "$MEMORY_DIR" ]]; then
+    echo -e "${RED}No .memory found.${NC}" >&2
+    return 1
+  fi
+
+  update_status "$id" "completed"
+  echo -e "${GREEN}Marked $id as completed${NC}"
+}
+
+# Mark as blocked
+cmd_block() {
+  local id="$1"
+  local reason="$2"
+
+  if [[ -z "$id" ]]; then
+    echo "Usage: mem block <id> [reason]" >&2
+    return 1
+  fi
+
+  if [[ -z "$MEMORY_DIR" ]]; then
+    echo -e "${RED}No .memory found.${NC}" >&2
+    return 1
+  fi
+
+  update_status "$id" "blocked"
+  echo -e "${YELLOW}Marked $id as blocked${NC}"
+
+  if [[ -n "$reason" ]]; then
+    # Find and append to the file
+    local file=$(jq -r ".todos[] | select(.id == \"$id\") | .file" "$MEMORY_DIR/index.json")
+    if [[ -n "$file" && -f "$MEMORY_DIR/$file" ]]; then
+      echo -e "\n**Blocked:** $reason ($(date +%Y-%m-%d))" >> "$MEMORY_DIR/$file"
+    fi
+  fi
+}
+
+# Show details of one item
+cmd_show() {
+  local id="$1"
+  if [[ -z "$id" ]]; then
+    echo "Usage: mem show <id>" >&2
+    return 1
+  fi
+
+  if [[ -z "$MEMORY_DIR" ]]; then
+    echo -e "${RED}No .memory found.${NC}" >&2
+    return 1
+  fi
+
+  local index_file="$MEMORY_DIR/index.json"
+  local file=$(jq -r "
+    (.decisions[] | select(.id == \"$id\") | .file) //
+    (.patterns[] | select(.id == \"$id\") | .file) //
+    (.blockers[] | select(.id == \"$id\") | .file) //
+    (.todos[] | select(.id == \"$id\") | .file) //
+    empty
+  " "$index_file")
+
+  if [[ -z "$file" ]]; then
+    echo -e "${RED}Not found: $id${NC}" >&2
+    return 1
+  fi
+
+  cat "$MEMORY_DIR/$file"
+}
+
+# Search memories
+cmd_search() {
+  local query="$1"
+  local type_filter="$2"
+
+  if [[ -z "$query" ]]; then
+    echo "Usage: mem search <query> [--type decision|pattern|blocker|todo]" >&2
+    return 1
+  fi
+
+  if [[ -z "$MEMORY_DIR" ]]; then
+    echo -e "${RED}No .memory found.${NC}" >&2
+    return 1
+  fi
+
+  local search_dirs="$MEMORY_DIR"
+  if [[ -n "$type_filter" ]]; then
+    search_dirs="$MEMORY_DIR/${type_filter}s"
+  fi
+
+  grep -ril "$query" "$search_dirs" 2>/dev/null | while read -r file; do
+    local rel="${file#$MEMORY_DIR/}"
+    echo -e "${BLUE}$rel${NC}"
+    grep -i --color=always "$query" "$file" | head -3
+    echo
+  done
+}
+
+# Output context for Claude session
+cmd_context() {
+  if [[ -z "$MEMORY_DIR" ]]; then
+    # No memory dir is fine - just output nothing
+    return 0
+  fi
+
+  local index_file="$MEMORY_DIR/index.json"
+
+  if [[ ! -f "$index_file" ]]; then
+    return 0
+  fi
+
+  echo "## Active Blockers"
+  local blockers=$(jq -r '.blockers[] | select(.status == "active") | "- [\(.id)] \(.title)"' "$index_file")
+  if [[ -z "$blockers" ]]; then
+    echo "None"
+  else
+    echo "$blockers"
+  fi
+
+  echo ""
+  echo "## Ready Todos"
+  local todos=$(jq -r '.todos[] | select(.status == "pending") | "- [\(.id)] \(.title)"' "$index_file")
+  if [[ -z "$todos" ]]; then
+    echo "None"
+  else
+    echo "$todos"
+  fi
+
+  echo ""
+  echo "## Available Context"
+  local d_count=$(jq '.decisions | length' "$index_file")
+  local p_count=$(jq '.patterns | length' "$index_file")
+  local t_count=$(jq '.todos | length' "$index_file")
+  echo "- $d_count decisions (query: \"what did we decide about X?\")"
+  echo "- $p_count patterns (query: \"how does X work?\")"
+  echo "- $t_count todos total"
+  echo ""
+  echo "Last updated: $(date +%Y-%m-%d)"
+}
+
+# Compact old items
+cmd_compact() {
+  echo "Compaction not yet implemented."
+  echo "For now, manually archive old items by moving to .memory/archive/"
+}
+
+# Main command router
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    add) cmd_add "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    ready) cmd_ready "$@" ;;
+    done) cmd_done "$@" ;;
+    block) cmd_block "$@" ;;
+    show) cmd_show "$@" ;;
+    search) cmd_search "$@" ;;
+    context) cmd_context "$@" ;;
+    compact) cmd_compact "$@" ;;
+    help|--help|-h)
+      echo "mem - Persistent memory for Claude sessions"
+      echo ""
+      echo "Commands:"
+      echo "  init                    Initialize .memory/ in current project"
+      echo "  add [-d|-p|-b|-t] TEXT  Add a memory (decision/pattern/blocker/todo)"
+      echo "  list [type]             List memories"
+      echo "  ready                   Show actionable todos"
+      echo "  done <id>               Mark todo as completed"
+      echo "  block <id> [reason]     Mark todo as blocked"
+      echo "  show <id>               Show details of one item"
+      echo "  search <query>          Search across memories"
+      echo "  context                 Output summary for Claude session"
+      echo ""
+      echo "Examples:"
+      echo "  mem init"
+      echo "  mem add -d \"Use JWT for auth\""
+      echo "  mem add -t \"Write failing test\" -e auth-feature"
+      echo "  mem ready"
+      echo "  mem done t-001"
+      ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      echo "Run 'mem help' for usage." >&2
+      return 1
+      ;;
+  esac
+}
+
+main "$@"
