@@ -4,6 +4,10 @@ Persistent memory system for Claude Code sessions. Maintains context across conv
 
 Inspired by [Beads](https://github.com/steveyegge/beads), designed to complement [superpowers](https://github.com/obra/superpowers).
 
+## Repository
+
+https://github.com/cristianj26/mem
+
 ## Why
 
 Claude loses context between sessions. You end up re-explaining:
